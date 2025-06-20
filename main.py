@@ -1,535 +1,152 @@
-# main.py
-import os
-import re
-import numpy as np
-import random
-import time
-from collections import defaultdict, deque
-from datetime import datetime, timedelta
-import telebot
-from flask import Flask, request
-from scipy.stats import norm, zscore
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import LabelEncoder
-import joblib
-import warnings
-warnings.filterwarnings('ignore')
+main.py
 
-app = Flask(__name__)
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-bot = telebot.TeleBot(BOT_TOKEN)
+import os import time from flask import Flask, request, abort import telebot from engine import predict
 
-# Constants
-MAX_HISTORY = 300
-TECHNIQUE_COUNT = 31
-SESSION_TIMEOUT = 1800  # 30 minutes
-BIG = {5, 6, 7, 8, 9}
-SMALL = {0, 1, 2, 3, 4}
-RED = {0, 2, 4, 6, 8}
-GREEN = {1, 3, 5, 7, 9}
+Environment
 
-# User session management
-user_sessions = {}
+BOT_TOKEN = os.getenv('BOT_TOKEN') if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN not set in environment variables") WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 
-class Technique:
-    def __init__(self, tid):
-        self.id = tid
-        self.accuracy = 0.5
-        self.last_prediction = None
-        self.last_confidence = 0.0
+bot = telebot.TeleBot(BOT_TOKEN) app = Flask(name)
 
-class UserSession:
-    def __init__(self):
-        self.history = []
-        self.big_small_chain = []
-        self.red_green_chain = []
-        self.techniques = {i: Technique(i) for i in range(TECHNIQUE_COUNT)}
-        self.last_activity = time.time()
-        self.last_predictions = {}
-        self.digit_probs = {}
-        self.big_small_prob = 0.5
-        self.red_green_prob = 0.5
-        self.ensemble_weights = {}
-        
-    def update_activity(self):
-        self.last_activity = time.time()
-    
-    def is_expired(self):
-        return time.time() - self.last_activity > SESSION_TIMEOUT
+In-memory session store\ sessions = {}  # user_id -> {'history': [], 'last_interaction': timestamp}
 
-def create_session(chat_id):
-    user_sessions[chat_id] = UserSession()
-    return user_sessions[chat_id]
+Session management & /start handler\ @bot.message_handler(commands=['start'])
 
-def get_session(chat_id):
-    if chat_id not in user_sessions or user_sessions[chat_id].is_expired():
-        return create_session(chat_id)
-    return user_sessions[chat_id]
+def handle_start(message): user_id = message.from_user.id sessions[user_id] = {'history': [], 'last_interaction': time.time()} bot.send_message(user_id, "Apni past market history bhejo (1–300 digits) is format me:\nStart 1 2 3 4 … End")
 
-# Helper functions
-def digit_to_emoji(d):
-    return f"{d}\U0000FE0F\U000020E3"
+General message handler\ @bot.message_handler(func=lambda m: True)
 
-def classify_digit(d):
-    big_small = 'B' if d in BIG else 'S'
-    red_green = 'G' if d in GREEN else 'R'
-    return big_small, red_green
+def handle_all(message): user_id = message.from_user.id text = message.text.strip() now = time.time() session = sessions.get(user_id) if not session or now - session['last_interaction'] > 1800: sessions[user_id] = {'history': [], 'last_interaction': now} bot.send_message(user_id, "Session reset due to inactivity. Please type /start to begin.") return session['last_interaction'] = now
 
-def parse_history(text):
-    digits = re.findall(r'\d', text)
-    return [int(d) for d in digits if d.isdigit()][:MAX_HISTORY]
+if text.startswith('Start') and text.endswith('End'):
+    parts = text.split()[1:-1]
+    try:
+        history = list(map(int, parts))
+    except ValueError:
+        bot.send_message(user_id, "Invalid digits. Use numbers 0–9 only.")
+        return
+    session['history'] = history
+    bot.send_message(user_id, "History received. Running analysis...")
+    return run_prediction(user_id)
 
-def softmax(x):
-    e_x = np.exp(np.array(x) - np.max(x))
-    return e_x / e_x.sum()
+if text.isdigit() and len(text) == 1:
+    digit = int(text)
+    session['history'].append(digit)
+    bot.send_message(user_id, "History updated. Re-running analysis...")
+    return run_prediction(user_id)
 
-def update_technique_accuracy(session, actual_digit):
-    for tid, tech in session.techniques.items():
-        if tech.last_prediction is None:
-            continue
-            
-        # Check if prediction was correct
-        correct = 1 if tech.last_prediction == actual_digit else 0
-        # Update accuracy with decay
-        tech.accuracy = 0.95 * tech.accuracy + 0.05 * correct
+bot.send_message(user_id, "Please send valid history or feedback digit.")
 
-# Analysis Techniques Implementation
-def chain_rule(chain):
-    if len(chain) < 2:
-        return None
-    
-    trans_counts = defaultdict(lambda: defaultdict(int))
-    for i in range(len(chain)-1):
-        trans_counts[chain[i]][chain[i+1]] += 1
-    
-    last = chain[-1]
-    if last in trans_counts:
-        total = sum(trans_counts[last].values())
-        return {k: v/total for k, v in trans_counts[last].items()}
-    return None
+Prediction runner
 
-def frequency_bias(chain):
-    counts = defaultdict(int)
-    for item in chain:
-        counts[item] += 1
-    total = len(chain)
-    return {k: v/total for k, v in counts.items()} if total > 0 else None
+def run_prediction(user_id): history = sessions[user_id]['history'] digit_chain = history bs_chain = ['B' if d >= 5 else 'S' for d in history] rg_chain = ['R' if d % 2 == 0 else 'G' for d in history] result = predict(digit_chain, bs_chain, rg_chain)
 
-def alternation_logic(chain):
-    if len(chain) < 2:
-        return None
-    
-    alt_count = 0
-    for i in range(1, len(chain)):
-        if chain[i] != chain[i-1]:
-            alt_count += 1
-            
-    p_alt = alt_count / (len(chain) - 1)
-    last = chain[-1]
-    options = list(set(chain))
-    return {val: p_alt if val != last else 1-p_alt for val in options}
+top4 = ', '.join([f"{d} ({p:.1f}%)" for d, p in result['top4_digits']])
+ds_pred, ds_p = result['big_small']
+rg_pred, rg_p = result['red_green']
+msg = (
+    f"📊 Prediction Report 🔍\n\n"
+    f"🔢 Top 4 Digits: {top4}\n\n"
+    f"🧠 Summary:\n"
+    f"1️⃣ Digit P’s: {top4}\n"
+    f"2️⃣ Big/Small: {ds_pred} ({ds_p:.1f}%)\n"
+    f"3️⃣ Red/Green: {rg_pred} ({rg_p:.1f}%)\n\n"
+    f"💰 Capital Strategy:\n"
+    f"• Primary Bet: 60%\n"
+    f"• Recovery: 30%\n"
+    f"• Stop-Loss: 10%\n"
+    f"Tip: Double-entry if confidence > 85%"
+)
+bot.send_message(user_id, msg)
 
-def rolling_adaptive(chain, window_size=10):
-    if len(chain) == 0:
-        return None
-    
-    window = chain[-window_size:]
-    counts = defaultdict(int)
-    for item in window:
-        counts[item] += 1
-    
-    total = len(window)
-    return {k: v/total for k, v in counts.items()}
+Flask routes\ @app.route('/')
 
-def markov_chain(chain, order=1):
-    if len(chain) <= order:
-        return None
-    
-    trans_counts = defaultdict(lambda: defaultdict(int))
-    for i in range(len(chain)-order):
-        state = tuple(chain[i:i+order])
-        next_val = chain[i+order]
-        trans_counts[state][next_val] += 1
-    
-    last_state = tuple(chain[-order:])
-    if last_state in trans_counts:
-        total = sum(trans_counts[last_state].values())
-        return {k: v/total for k, v in trans_counts[last_state].items()}
-    return None
+def health_check(): return "OK"
 
-def markov_recency(chain, alpha=0.7):
-    if len(chain) < 2:
-        return None
-    
-    # Recent events have higher weight
-    weights = [alpha * (1-alpha)**i for i in range(len(chain)-1)]
-    weights.reverse()
-    weights = np.array(weights) / sum(weights)
-    
-    trans_counts = defaultdict(lambda: defaultdict(float))
-    for i, w in zip(range(len(chain)-1), weights):
-        trans_counts[chain[i]][chain[i+1]] += w
-    
-    last = chain[-1]
-    if last in trans_counts:
-        total = sum(trans_counts[last].values())
-        return {k: v/total for k, v in trans_counts[last].items()}
-    return None
+@app.route('/webhook', methods=['POST']) def telegram_webhook(): if request.headers.get('content-type') == 'application/json': json_str = request.get_data().decode('utf-8') update = telebot.types.Update.de_json(json_str) bot.process_new_updates([update]) return '', 200 else: abort(403)
 
-def laplace_smoothing(chain, v=10):
-    if len(chain) < 2:
-        return None
-    
-    trans_counts = defaultdict(lambda: defaultdict(int))
-    for i in range(len(chain)-1):
-        trans_counts[chain[i]][chain[i+1]] += 1
-    
-    last = chain[-1]
-    if last in trans_counts:
-        total = sum(trans_counts[last].values())
-        options = set(chain)
-        return {k: (trans_counts[last].get(k, 0) + 1) / (total + v) for k in options}
-    return None
+if name == 'main': bot.remove_webhook() bot.set_webhook(url=WEBHOOK_URL) app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
 
-def group_digit_distribution(digit_probs):
-    p_big = sum(prob for digit, prob in digit_probs.items() if digit in BIG)
-    p_small = sum(prob for digit, prob in digit_probs.items() if digit in SMALL)
-    p_red = sum(prob for digit, prob in digit_probs.items() if digit in RED)
-    p_green = sum(prob for digit, prob in digit_probs.items() if digit in GREEN)
-    return {'B': p_big, 'S': p_small}, {'R': p_red, 'G': p_green}
+engine.py
 
-def weighted_ensemble(techniques, session):
-    total_weight = sum(tech.accuracy for tech in techniques.values())
-    if total_weight == 0:
-        return None
-    
-    digit_probs = defaultdict(float)
-    for tech in techniques.values():
-        if tech.last_prediction is not None:
-            digit_probs[tech.last_prediction] += tech.accuracy * tech.last_confidence
-    
-    for d in digit_probs:
-        digit_probs[d] /= total_weight
-    
-    return digit_probs
+import numpy as np from typing import List, Dict, Tuple import random
 
-def bayesian_update(prior, likelihood):
-    posterior = {}
-    total = 0
-    for d in prior:
-        posterior[d] = prior[d] * likelihood.get(d, 0.01)
-        total += posterior[d]
-    
-    if total > 0:
-        for d in posterior:
-            posterior[d] /= total
-    return posterior
+Placeholder for technique accuracies (update via feedback)
 
-def time_decayed_history(chain, lambda_val=0.1):
-    if len(chain) == 0:
-        return None
-    
-    weights = [np.exp(-lambda_val * (len(chain)-1-i)) for i in range(len(chain))]
-    total_weight = sum(weights)
-    
-    counts = defaultdict(float)
-    for i, w in enumerate(weights):
-        counts[chain[i]] += w
-    
-    return {k: v/total_weight for k, v in counts.items()}
+tech_accuracy = {i: 1.0 for i in range(1, 32)}
 
-def ngram_features(chain, n=3):
-    if len(chain) < n:
-        return None
-    
-    ngrams = defaultdict(int)
-    for i in range(len(chain)-n+1):
-        ngram = tuple(chain[i:i+n])
-        ngrams[ngram] += 1
-    
-    return ngrams
+Core helper: normalized probabilities
 
-def zscore_anomaly(chain, threshold=2.5):
-    if len(chain) < 10:
-        return None
-    
-    counts = defaultdict(int)
-    for d in chain:
-        counts[d] += 1
-    
-    freqs = np.array([counts.get(i, 0) for i in range(10)])
-    zscores = zscore(freqs)
-    anomalies = [i for i in range(10) if abs(zscores[i]) > threshold]
-    return anomalies
+def normalize(probs: Dict) -> Dict: total = sum(probs.values()) or 1 return {k: v/total for k, v in probs.items()}
 
-# Main analysis function
-def analyze_data(session):
-    digit_chain = session.history
-    big_small_chain = session.big_small_chain
-    red_green_chain = session.red_green_chain
-    
-    # Technique 1: Chain Rule
-    cr_digit = chain_rule(digit_chain) or {}
-    cr_bs = chain_rule(big_small_chain) or {}
-    cr_rg = chain_rule(red_green_chain) or {}
-    
-    # Technique 2: Frequency Bias
-    fb_digit = frequency_bias(digit_chain) or {}
-    fb_bs = frequency_bias(big_small_chain) or {}
-    fb_rg = frequency_bias(red_green_chain) or {}
-    
-    # Technique 3: Alternation Logic
-    alt_bs = alternation_logic(big_small_chain) or {}
-    alt_rg = alternation_logic(red_green_chain) or {}
-    
-    # Technique 5: Rolling Adaptive
-    ra_digit = rolling_adaptive(digit_chain) or {}
-    
-    # Technique 8: Markov Chain
-    mk_digit = markov_chain(digit_chain) or {}
-    
-    # Technique 9: Markov with Recency
-    mk_recency = markov_recency(digit_chain) or {}
-    
-    # Technique 10: Laplace Smoothing
-    lp_digit = laplace_smoothing(digit_chain) or {}
-    
-    # Technique 21: Time Decayed History
-    td_digit = time_decayed_history(digit_chain) or {}
-    
-    # Collect predictions
-    predictions = {}
-    
-    # Technique 1 prediction
-    if digit_chain and cr_digit:
-        pred = max(cr_digit, key=cr_digit.get, default=None)
-        conf = max(cr_digit.values()) if cr_digit else 0
-        session.techniques[0].last_prediction = pred
-        session.techniques[0].last_confidence = conf
-        predictions[0] = (pred, conf)
-    
-    # Technique 2 prediction
-    if fb_digit:
-        pred = max(fb_digit, key=fb_digit.get, default=None)
-        conf = max(fb_digit.values()) if fb_digit else 0
-        session.techniques[1].last_prediction = pred
-        session.techniques[1].last_confidence = conf
-        predictions[1] = (pred, conf)
-    
-    # Technique 3 prediction (based on alternation)
-    if alt_bs and alt_rg and digit_chain:
-        last_digit = digit_chain[-1]
-        last_bs, last_rg = classify_digit(last_digit)
-        
-        # Predict next based on alternation
-        next_bs = 'S' if last_bs == 'B' else 'B'
-        next_rg = 'R' if last_rg == 'G' else 'G'
-        
-        # Find digits that match both
-        possible_digits = [d for d in range(10) 
-                          if ('B' if d in BIG else 'S') == next_bs
-                          and ('G' if d in GREEN else 'R') == next_rg]
-        
-        if possible_digits:
-            pred = random.choice(possible_digits)
-            conf = 0.7  # arbitrary confidence
-            session.techniques[2].last_prediction = pred
-            session.techniques[2].last_confidence = conf
-            predictions[2] = (pred, conf)
-    
-    # Technique 5 prediction
-    if ra_digit:
-        pred = max(ra_digit, key=ra_digit.get, default=None)
-        conf = max(ra_digit.values()) if ra_digit else 0
-        session.techniques[4].last_prediction = pred
-        session.techniques[4].last_confidence = conf
-        predictions[4] = (pred, conf)
-    
-    # Technique 8 prediction
-    if mk_digit:
-        pred = max(mk_digit, key=mk_digit.get, default=None)
-        conf = max(mk_digit.values()) if mk_digit else 0
-        session.techniques[7].last_prediction = pred
-        session.techniques[7].last_confidence = conf
-        predictions[7] = (pred, conf)
-    
-    # Technique 9 prediction
-    if mk_recency:
-        pred = max(mk_recency, key=mk_recency.get, default=None)
-        conf = max(mk_recency.values()) if mk_recency else 0
-        session.techniques[8].last_prediction = pred
-        session.techniques[8].last_confidence = conf
-        predictions[8] = (pred, conf)
-    
-    # Technique 10 prediction
-    if lp_digit:
-        pred = max(lp_digit, key=lp_digit.get, default=None)
-        conf = max(lp_digit.values()) if lp_digit else 0
-        session.techniques[9].last_prediction = pred
-        session.techniques[9].last_confidence = conf
-        predictions[9] = (pred, conf)
-    
-    # Technique 21 prediction
-    if td_digit:
-        pred = max(td_digit, key=td_digit.get, default=None)
-        conf = max(td_digit.values()) if td_digit else 0
-        session.techniques[20].last_prediction = pred
-        session.techniques[20].last_confidence = conf
-        predictions[20] = (pred, conf)
-    
-    # Fill in missing techniques with random predictions
-    for tid in range(TECHNIQUE_COUNT):
-        if tid not in predictions:
-            pred = random.randint(0, 9)
-            conf = random.uniform(0.5, 0.9)
-            session.techniques[tid].last_prediction = pred
-            session.techniques[tid].last_confidence = conf
-            predictions[tid] = (pred, conf)
-    
-    # Technique 13: Weighted Ensemble
-    ensemble_probs = weighted_ensemble(session.techniques, session)
-    if ensemble_probs:
-        session.digit_probs = ensemble_probs
-        # Get top 4 digits
-        top_digits = sorted(ensemble_probs.items(), key=lambda x: x[1], reverse=True)[:4]
-    else:
-        # Fallback to frequency bias
-        if not fb_digit:
-            fb_digit = {i: 0.1 for i in range(10)}
-        top_digits = sorted(fb_digit.items(), key=lambda x: x[1], reverse=True)[:4]
-        session.digit_probs = dict(top_digits)
-    
-    # Technique 12: Group Digit Distribution
-    bs_probs, rg_probs = group_digit_distribution(session.digit_probs)
-    session.big_small_prob = bs_probs.get('B', 0.5)
-    session.red_green_prob = rg_probs.get('G', 0.5)
-    
-    return {
-        'digits': top_digits,
-        'big_small': session.big_small_prob,
-        'red_green': session.red_green_prob
-    }
+1. Chain Rule
 
-# Telegram bot handlers
-@bot.message_handler(commands=['start', 'run', 'prediction', 'x'])
-def handle_start(message):
-    chat_id = message.chat.id
-    session = get_session(chat_id)
-    session.update_activity()
-    
-    bot.send_message(chat_id, "📊 Welcome to Reality of World Predictor Bot!\n\n"
-                     "Send your past market history (1-300 digits) in this format:\n"
-                     "Start 1 2 3 4 5 ... End")
+def chain_rule(chain: List, state) -> Dict: trans = {} for a, b in zip(chain, chain[1:]): trans.setdefault(a, {}).setdefault(b, 0) trans[a][b] += 1 if state not in trans: return {} return normalize(trans[state])
 
-@bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    chat_id = message.chat.id
-    session = get_session(chat_id)
-    session.update_activity()
-    text = message.text.strip()
-    
-    # Handle history input
-    if text.lower().startswith('start') and text.lower().endswith('end'):
-        history = parse_history(text)
-        if not history:
-            bot.send_message(chat_id, "❌ Invalid format. Please send in: Start 1 2 3 4 5 ... End")
-            return
-        
-        session.history = history
-        session.big_small_chain = ['B' if d in BIG else 'S' for d in history]
-        session.red_green_chain = ['G' if d in GREEN else 'R' for d in history]
-        
-        # Analyze and send results
-        results = analyze_data(session)
-        send_prediction_report(chat_id, results)
-    
-    # Handle single digit feedback
-    elif text.isdigit() and len(text) == 1:
-        digit = int(text)
-        
-        if not session.history:
-            bot.send_message(chat_id, "⚠️ Please send your history first using: Start ... End")
-            return
-        
-        # Update history
-        session.history.append(digit)
-        bs, rg = classify_digit(digit)
-        session.big_small_chain.append(bs)
-        session.red_green_chain.append(rg)
-        
-        # Update technique accuracies
-        update_technique_accuracy(session, digit)
-        
-        # Re-analyze
-        results = analyze_data(session)
-        bot.send_message(chat_id, "🔄 Updated history. Re-running analysis...")
-        send_prediction_report(chat_id, results)
-    
-    else:
-        bot.send_message(chat_id, "❌ Unrecognized input. Please send:\n"
-                         "- 'Start ... End' with your history\n"
-                         "- Single digit for feedback")
+2. Frequency Bias
 
-def send_prediction_report(chat_id, results):
-    # Format top digits
-    digit_lines = []
-    for digit, prob in results['digits']:
-        emoji = digit_to_emoji(digit)
-        digit_lines.append(f"{emoji} ({prob*100:.1f}%)")
-    
-    # Determine group predictions
-    big_small = "Big 🟦" if results['big_small'] >= 0.5 else "Small 🟥"
-    big_small_prob = max(results['big_small'], 1 - results['big_small'])
-    
-    red_green = "Green 🟩" if results['red_green'] >= 0.5 else "Red 🟥"
-    red_green_prob = max(results['red_green'], 1 - results['red_green'])
-    
-    # Capital strategy based on confidence
-    top_confidence = results['digits'][0][1]
-    if top_confidence > 0.85:
-        strategy = "• Primary Bet: 70%\n• Recovery: 20%\n• Stop-Loss: 10%\n💡 Tip: Double-entry recommended!"
-    elif top_confidence > 0.7:
-        strategy = "• Primary Bet: 60%\n• Recovery: 30%\n• Stop-Loss: 10%\n💡 Tip: Single strong entry"
-    else:
-        strategy = "• Primary Bet: 50%\n• Recovery: 40%\n• Stop-Loss: 10%\n💡 Tip: Wait for better opportunity"
-    
-    # Format message
-    report = (
-        "📊 Prediction Report 🔍\n\n"
-        "🔢 Top 4 Digits:\n" + "\n".join(digit_lines) + "\n\n"
-        "🧠 Summary:\n"
-        f"1️⃣ Digit Probabilities: {', '.join([f'{d}→{p*100:.1f}%' for d, p in results['digits'])}\n"
-        f"2️⃣ Big/Small: {big_small} ({big_small_prob*100:.1f}%)\n"
-        f"3️⃣ Red/Green: {red_green} ({red_green_prob*100:.1f}%)\n\n"
-        "💰 Capital Strategy:\n" + strategy
-    )
-    
-    bot.send_message(chat_id, report)
+def frequency_bias(chain: List) -> Dict: counts = {} for x in chain: counts[x] = counts.get(x, 0) + 1 return normalize(counts)
 
-# Flask routes
-@app.route('/')
-def index():
-    return "Bot is running!", 200
+3. Alternation Logic
 
-@app.route(f'/{BOT_TOKEN}', methods=['POST'])
-def webhook():
-    json_data = request.get_json()
-    update = telebot.types.Update.de_json(json_data)
-    bot.process_new_updates([update])
-    return '', 200
+def alternation_logic(chain: List, pair: Tuple) -> Dict: alt = sum(1 for a, b in zip(chain, chain[1:]) if (a, b) == pair or (a, b) == pair[::-1]) total = len(chain)-1 or 1 return {pair[0]: alt/total, pair[1]: 1 - alt/total}
 
-if __name__ == '__main__':
-    # Clean up expired sessions periodically
-    def clean_sessions():
-        while True:
-            expired = [cid for cid, sess in user_sessions.items() if sess.is_expired()]
-            for cid in expired:
-                del user_sessions[cid]
-            time.sleep(300)  # Check every 5 minutes
-    
-    import threading
-    threading.Thread(target=clean_sessions, daemon=True).start()
-    
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+4. Combined Voting
+
+def combined_voting(preds: List[Dict]) -> Dict: votes = {} for p in preds: if not p: continue top = max(p.items(), key=lambda x: x[1])[0] votes[top] = votes.get(top, 0) + 1 return normalize(votes)
+
+5. Rolling Adaptive
+
+def rolling_adaptive(chain: List, k: int = 5) -> Dict: window = chain[-k:] return frequency_bias(window)
+
+6. Only Real Feedback Append -> no-op technique
+
+def feedback_append(*args, **kwargs) -> Dict: return {}
+
+7. Dynamic Re-learning -> no-op stub
+
+def dynamic_relearning(*args, **kwargs) -> Dict: return {}
+
+8. Markov Chain
+
+def markov_chain(chain: List) -> Dict: return chain_rule(chain, chain[-1]) if chain else {}
+
+9. Markov + Recency Bias
+
+def markov_recency(chain: List, alpha: float = 0.8) -> Dict: old = markov_chain(chain[:-1]) if len(chain)>1 else {} new = chain_rule(chain, chain[-1]) merged = {k: alpha*new.get(k,0) + (1-alpha)*old.get(k,0) for k in set(old)|set(new)} return normalize(merged)
+
+#10. Laplace Smoothing def laplace_smoothing(chain: List, V: int) -> Dict: counts = {x: chain.count(x)+1 for x in set(chain)} total = len(chain) + V return {k: v/total for k, v in counts.items()}
+
+#11. Threshold Validation def threshold_validation(probs: Dict, fallback: Dict, theta: float=0.6) -> Dict: top = max(probs.values()) if probs else 0 return probs if top>=theta else fallback
+
+#12. Group Digit Distribution def group_distribution(digit_probs: Dict) -> Dict: big = sum(p for d,p in digit_probs.items() if d>=5) small = sum(p for d,p in digit_probs.items() if d<5) return {'Big': big, 'Small': small}
+
+#13. Weighted Ensemble def weighted_ensemble(preds: List[Dict]) -> Dict: weights = np.array([tech_accuracy[i+1] for i in range(len(preds))]) weights /= weights.sum() or 1 combined = {} for w,pred in zip(weights, preds): for k,v in pred.items(): combined[k] = combined.get(k,0)+w*v return normalize(combined)
+
+#14. Model Diversity -> stub #15. Feedback Loop Update -> stub #16. Bayesian Updating def bayesian_update(prior: Dict, likelihood: Dict) -> Dict: post = {k: prior.get(k,0)*likelihood.get(k,0) for k in set(prior)|set(likelihood)} return normalize(post)
+
+#17. Ensemble Stacking -> stub #18. HMM -> stub #19. Particle Filter -> stub #20. Change-Point Detection -> stub #21. Time-Decayed History def time_decay(chain: List, lam: float=0.1) -> Dict: weights = {chain[i]: np.exp(-lam*(len(chain)-i-1)) for i in range(len(chain))} return normalize(weights)
+
+#22. Cross-Validation & Backtesting -> stub #23. N-Gram Features def ngram_features(chain: List, n: int=2) -> Dict: feats = {} for i in range(len(chain)-n+1): seq = tuple(chain[i:i+n]) feats[seq] = feats.get(seq,0)+1 return normalize(feats)
+
+#24. XGBoost -> stub (requires external lib) #25. Probability Calibration -> stub #26. Adversarial Testing -> stub #27. Online Hyperparam Opt -> stub #28. Multi-Resolution Trends -> stub #29. Anomaly Detection def anomaly_filter(chain: List) -> Dict: mean = np.mean(chain) std = np.std(chain) or 1 zscores = {(d): abs((d-mean)/std) for d in chain} return normalize({d:1/(1+z) for d,z in zscores.items()})
+
+#30. RL Group Predictor -> stub #31. Accuracy-Weighted Voting -> uses weighted_ensemble
+
+Super Ensemble Controller
+
+def super_ensemble(preds: List[Dict]) -> Dict: return weighted_ensemble(preds)
+
+Main predict
+
+def predict( digit_chain: List[int], bs_chain: List[str], rg_chain: List[str] ) -> Dict[str, object]: # Collect preds dp, bp, rp = [], [], [] # 1-3 if digit_chain: dp.append(chain_rule(digit_chain, digit_chain[-1])) dp.append(frequency_bias(digit_chain)) # Alternation not for digits # 4-5 dp.append(combined_voting(dp)) dp.append(rolling_adaptive(digit_chain)) # 6-7 dp.append(feedback_append()) dp.append(dynamic_relearning()) # 8-10 dp.append(markov_chain(digit_chain)) dp.append(markov_recency(digit_chain)) dp.append(laplace_smoothing(digit_chain, V=10)) # 11-13 dp.append(threshold_validation(dp[-1], frequency_bias(digit_chain))) dp.append(group_distribution(frequency_bias(digit_chain))) dp.append(weighted_ensemble(dp)) # 14-15 stub # 16 dp.append(bayesian_update(frequency_bias(digit_chain), dp[0])) # 17-23 mix stubs + ngram dp.append(ngram_features(digit_chain)) dp.append(anomaly_filter(digit_chain)) # 24-31 stubs or reuse # Super ensemble final_digit = super_ensemble(dp) final_bs = super_ensemble([frequency_bias([1 if c=='B' else 0 for c in bs_chain]), alternation_logic(bs_chain,('B','S')), group_distribution(final_digit)]) final_rg = super_ensemble([frequency_bias([1 if c=='R' else 0 for c in rg_chain]), alternation_logic(rg_chain,('R','G')), group_distribution(final_digit)])
+
+top4 = sorted(final_digit.items(), key=lambda x: x[1], reverse=True)[:4]
+bs_pred, bs_conf = max(final_bs.items(), key=lambda x: x[1])
+rg_pred, rg_conf = max(final_rg.items(), key=lambda x: x[1])
+return {
+    'top4_digits': [(d, p*100) for d, p in top4],
+    'big_small': (bs_pred, bs_conf*100),
+    'red_green': (rg_pred, rg_conf*100)
+}
+
