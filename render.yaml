@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: reality-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app
+    envVars:
+      - key: BOT_TOKEN
+        value: 8102411974:AAHhyXBg4FdzZ08hzl1wRrpwtVbeoAomL4g
